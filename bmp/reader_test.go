@@ -187,7 +187,10 @@ type bmpBuilder struct {
 	colorsUsed      uint32
 	colorsImportant uint32
 	colorTable      []colorTableEntry
-	data            []byte
+	// extra is appended between the color table and the pixel data, e.g.
+	// to hold BI_BITFIELDS masks for a 40-byte info header.
+	extra []byte
+	data  []byte
 }
 
 type colorTableEntry struct {
@@ -215,6 +218,7 @@ func (b bmpBuilder) Bytes() []byte {
 	for _, e := range b.colorTable {
 		buf = append(buf, e.r, e.g, e.b, 0)
 	}
+	buf = append(buf, b.extra...)
 	binary.LittleEndian.PutUint32(buf[10:], uint32(len(buf))) // data offset
 	buf = append(buf, b.data...)
 	binary.LittleEndian.PutUint32(buf[2:], uint32(len(buf))) // file size

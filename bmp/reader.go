@@ -20,7 +20,10 @@ import (
 // feature.
 var ErrUnsupported = errors.New("bmp: unsupported BMP image")
 
-var errInvalidPaletteIndex = errors.New("bmp: invalid palette index")
+var (
+	errInvalidPaletteIndex = errors.New("bmp: invalid palette index")
+	errInvalidBitfieldMask = errors.New("bmp: invalid bitfield mask")
+)
 
 func readUint16(b []byte) uint16 {
 	return uint16(b[0]) | uint16(b[1])<<8
@@ -68,6 +71,38 @@ func decodePaletted(r io.Reader, c image.Config, topDown bool, bpp int) (image.I
 		}
 	}
 	return paletted, nil
+}
+
+// decodeRGB16 reads a 16 bit-per-pixel BMP image from r.
+// If h.topDown is false, the image rows will be read bottom-up.
+func decodeRGB16(r io.Reader, h *bmpHeader) (image.Image, error) {
+	w, height := h.config.Width, h.config.Height
+	img := h.newImage(image.Rect(0, 0, w, height))
+	if w == 0 || height == 0 {
+		return img, nil
+	}
+	var pix []byte
+	var stride int
+	switch img := img.(type) {
+	case *image.RGBA:
+		pix, stride = img.Pix, img.Stride
+	case *image.NRGBA:
+		pix, stride = img.Pix, img.Stride
+	}
+	buf := make([]byte, h.rowBytes)
+	conv := h.converter()
+	y0, y1, yDelta := height-1, -1, -1
+	if h.topDown {
+		y0, y1, yDelta = 0, height, +1
+	}
+	for y := y0; y != y1; y += yDelta {
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		// The 16 bit-per-pixel converter never returns an error.
+		_ = conv(y, -1, pix[y*stride:], buf, 0, w)
+	}
+	return img, nil
 }
 
 // decodeRGB reads a 24 bit-per-pixel BMP image from r.
@@ -127,32 +162,71 @@ func decodeNRGBA(r io.Reader, c image.Config, topDown, allowAlpha bool) (image.I
 }
 
 // Decode reads a BMP image from r and returns it as an image.Image.
-// Limitation: The file must be 8, 24 or 32 bits per pixel.
+// Limitation: The file must be 1, 2, 4, 8, 16, 24 or 32 bits per pixel.
 func Decode(r io.Reader) (image.Image, error) {
-	c, bpp, topDown, allowAlpha, err := decodeConfig(r)
+	h, err := decodeConfig(r)
 	if err != nil {
-		return nil, err
+		return nil, bareError(err)
 	}
-	switch bpp {
+	switch h.bpp {
 	case 1, 2, 4, 8:
-		return decodePaletted(r, c, topDown, bpp)
+		return decodePaletted(r, h.config, h.topDown, h.bpp)
+	case 16:
+		return decodeRGB16(r, h)
 	case 24:
-		return decodeRGB(r, c, topDown)
+		return decodeRGB(r, h.config, h.topDown)
 	case 32:
-		return decodeNRGBA(r, c, topDown, allowAlpha)
+		return decodeNRGBA(r, h.config, h.topDown, h.allowAlpha)
 	}
 	panic("unreachable")
 }
 
 // DecodeConfig returns the color model and dimensions of a BMP image without
 // decoding the entire image.
-// Limitation: The file must be 8, 24 or 32 bits per pixel.
+// Limitation: The file must be 1, 2, 4, 8, 16, 24 or 32 bits per pixel.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	config, _, _, _, err := decodeConfig(r)
-	return config, err
+	h, err := decodeConfig(r)
+	if err != nil {
+		return image.Config{}, bareError(err)
+	}
+	return h.config, nil
 }
 
-func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown bool, allowAlpha bool, err error) {
+// bareError unwraps the *RegionError that decodeConfig attaches to header
+// errors, preserving the historical error values returned by Decode and
+// DecodeConfig.
+func bareError(err error) error {
+	if re, ok := err.(*RegionError); ok {
+		return re.Err
+	}
+	return err
+}
+
+// bmpHeader describes the parsed headers of a BMP file.
+type bmpHeader struct {
+	config       image.Config
+	bpp          int
+	topDown      bool
+	allowAlpha   bool
+	dataOffset   int64     // file offset of the pixel data
+	rowBytes     int       // size of one row of pixel data, including padding
+	masks        [4]uint32 // R, G, B and A bitfield masks, for 16 bpp images
+	hasAlphaMask bool
+}
+
+// rowBytes returns the size in bytes of one row of a BMP image with the
+// given width and bits-per-pixel, including padding to a 4-byte boundary.
+// The caller must have already checked that the image dimensions fit in
+// memory, so the result cannot overflow.
+func rowBytes(width, bpp int) int {
+	n := width * (bpp / 8)
+	if bpp < 8 {
+		n = (width + 8/bpp - 1) / (8 / bpp)
+	}
+	return (n + 3) &^ 3
+}
+
+func decodeConfig(r io.Reader) (*bmpHeader, error) {
 	// We only support those BMP images with one of the following DIB headers:
 	// - BITMAPINFOHEADER (40 bytes)
 	// - BITMAPV4HEADER (108 bytes)
@@ -163,47 +237,51 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		v4InfoHeaderLen = 108
 		v5InfoHeaderLen = 124
 	)
+	headerErr := func(offset int64, err error) error {
+		return &RegionError{Op: "parse", Row: -1, Offset: offset, Err: err}
+	}
 	var b [1024]byte
 	if _, err := io.ReadFull(r, b[:fileHeaderLen+4]); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return image.Config{}, 0, false, false, err
+		return nil, headerErr(0, err)
 	}
 	if string(b[:2]) != "BM" {
-		return image.Config{}, 0, false, false, errors.New("bmp: invalid format")
+		return nil, headerErr(0, errors.New("bmp: invalid format"))
 	}
 	offset := readUint32(b[10:14])
 	infoLen := readUint32(b[14:18])
 	if infoLen != infoHeaderLen && infoLen != v4InfoHeaderLen && infoLen != v5InfoHeaderLen {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return nil, headerErr(14, ErrUnsupported)
 	}
 	if _, err := io.ReadFull(r, b[fileHeaderLen+4:fileHeaderLen+infoLen]); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return image.Config{}, 0, false, false, err
+		return nil, headerErr(fileHeaderLen+4, err)
 	}
 	width := int(int32(readUint32(b[18:22])))
 	height := int(int32(readUint32(b[22:26])))
+	topDown := false
 	if height < 0 {
 		height, topDown = -height, true
 	}
 	if width < 0 || height < 0 {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return nil, headerErr(18, ErrUnsupported)
 	}
 	if (width == 0) != (height == 0) {
 		// We'll take 0x0, but Nx0 or 0xN is suspicious.
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return nil, headerErr(18, ErrUnsupported)
 	}
 	// Check that the image fits in memory.
 	// This conservatively assumes 4 bytes per pixel,
 	// rather than using the actual pixel size.
 	if _, ok := safemath.Mul3(width, height, 4); !ok {
-		return image.Config{}, 0, false, false, ErrUnsupported
+		return nil, headerErr(18, ErrUnsupported)
 	}
-	// We only support 1 plane and 8, 24 or 32 bits per pixel and no
-	// compression.
+	// We only support 1 plane and no compression, except for 16 bpp
+	// BI_BITFIELDS images.
 	planes, bpp, compression := readUint16(b[26:28]), readUint16(b[28:30]), readUint32(b[30:34])
 	// if compression is set to BI_BITFIELDS, but the bitmask is set to the default bitmask
 	// that would be used if compression was set to 0, we can continue as if compression was 0
@@ -212,8 +290,14 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		readUint32(b[62:66]) == 0xff && readUint32(b[66:70]) == 0xff000000 {
 		compression = 0
 	}
-	if planes != 1 || compression != 0 {
-		return image.Config{}, 0, false, false, ErrUnsupported
+	if planes != 1 || (compression != 0 && !(compression == 3 && bpp == 16)) {
+		return nil, headerErr(26, ErrUnsupported)
+	}
+	h := &bmpHeader{
+		bpp:        int(bpp),
+		topDown:    topDown,
+		dataOffset: int64(offset),
+		rowBytes:   rowBytes(width, int(bpp)),
 	}
 	switch bpp {
 	case 1, 2, 4, 8:
@@ -222,15 +306,14 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		if colorUsed == 0 {
 			colorUsed = 1 << bpp
 		} else if colorUsed > (1 << bpp) {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return nil, headerErr(46, ErrUnsupported)
 		}
 
 		if offset != fileHeaderLen+infoLen+colorUsed*4 {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return nil, headerErr(10, ErrUnsupported)
 		}
-		_, err = io.ReadFull(r, b[:colorUsed*4])
-		if err != nil {
-			return image.Config{}, 0, false, false, err
+		if _, err := io.ReadFull(r, b[:colorUsed*4]); err != nil {
+			return nil, headerErr(int64(fileHeaderLen+infoLen), err)
 		}
 		pcm := make(color.Palette, colorUsed)
 		for i := range pcm {
@@ -238,15 +321,57 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 			// Every 4th byte is padding.
 			pcm[i] = color.RGBA{b[4*i+2], b[4*i+1], b[4*i+0], 0xFF}
 		}
-		return image.Config{ColorModel: pcm, Width: width, Height: height}, int(bpp), topDown, false, nil
+		h.config = image.Config{ColorModel: pcm, Width: width, Height: height}
+	case 16:
+		// The default (BI_RGB) 16 bpp layout is RGB555.
+		h.masks = [4]uint32{0x7c00, 0x03e0, 0x001f, 0}
+		dataOffset := int64(fileHeaderLen + infoLen)
+		if compression == 3 {
+			maskOffset := dataOffset
+			if infoLen > infoHeaderLen {
+				// BITMAPV4HEADER and later store the masks in the
+				// info header itself.
+				h.masks[0] = readUint32(b[54:58])
+				h.masks[1] = readUint32(b[58:62])
+				h.masks[2] = readUint32(b[62:66])
+				h.masks[3] = readUint32(b[66:70])
+			} else {
+				// For a BITMAPINFOHEADER, the bitfield masks are stored
+				// in the file immediately after the header: 12 bytes for
+				// the R, G and B masks, plus an optional 4-byte alpha
+				// mask.
+				if _, err := io.ReadFull(r, b[:12]); err != nil {
+					return nil, headerErr(dataOffset, err)
+				}
+				h.masks[0] = readUint32(b[0:4])
+				h.masks[1] = readUint32(b[4:8])
+				h.masks[2] = readUint32(b[8:12])
+				dataOffset += 12
+				if offset == uint32(dataOffset)+4 {
+					if _, err := io.ReadFull(r, b[:4]); err != nil {
+						return nil, headerErr(dataOffset, err)
+					}
+					h.masks[3] = readUint32(b[0:4])
+					dataOffset += 4
+				}
+			}
+			h.hasAlphaMask = h.masks[3] != 0
+			if err := checkBitfieldMasks(h.masks, h.hasAlphaMask, maskOffset); err != nil {
+				return nil, err
+			}
+		}
+		if int64(offset) != dataOffset {
+			return nil, headerErr(10, ErrUnsupported)
+		}
+		h.config = image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}
 	case 24:
 		if offset != fileHeaderLen+infoLen {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return nil, headerErr(10, ErrUnsupported)
 		}
-		return image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}, 24, topDown, false, nil
+		h.config = image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}
 	case 32:
 		if offset != fileHeaderLen+infoLen {
-			return image.Config{}, 0, false, false, ErrUnsupported
+			return nil, headerErr(10, ErrUnsupported)
 		}
 		// 32 bits per pixel is possibly RGBX (X is padding) or RGBA (A is
 		// alpha transparency). However, for BMP images, "Alpha is a
@@ -268,10 +393,12 @@ func decodeConfig(r io.Reader) (config image.Config, bitsPerPixel int, topDown b
 		// This Go package does not support ICO files and the (infoLen >
 		// infoHeaderLen) condition distinguishes BITMAPINFOHEADER (40 bytes)
 		// vs later (larger) headers.
-		allowAlpha = infoLen > infoHeaderLen
-		return image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}, 32, topDown, allowAlpha, nil
+		h.allowAlpha = infoLen > infoHeaderLen
+		h.config = image.Config{ColorModel: color.RGBAModel, Width: width, Height: height}
+	default:
+		return nil, headerErr(28, ErrUnsupported)
 	}
-	return image.Config{}, 0, false, false, ErrUnsupported
+	return h, nil
 }
 
 func init() {
