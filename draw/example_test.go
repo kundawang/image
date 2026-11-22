@@ -5,6 +5,7 @@
 package draw_test
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"time"
 
 	"golang.org/x/image/draw"
 	"golang.org/x/image/math/f64"
@@ -115,4 +117,45 @@ func ExampleDraw() {
 	fmt.Printf("dst has bounds %v.\n", dst.Bounds())
 	// Output:
 	// dst has bounds (0,0)-(400,300).
+}
+
+func ExampleDrawTiled() {
+	src, err := os.Open("../testdata/blue-purple-pink.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer src.Close()
+	img, err := png.Decode(src)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// A large canvas that several images are composited onto.
+	dst := image.NewRGBA(image.Rect(0, 0, 4096, 4096))
+	draw.Draw(dst, dst.Bounds(), image.NewUniform(color.Black), image.Point{}, draw.Src)
+
+	// Tiling only changes how the work is scheduled: the result is identical to
+	// draw.Draw. The workers split the destination into 256x256 tiles, and the
+	// context lets the caller stop a long composite.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	opts := &draw.TileOptions{
+		TileSize: draw.DefaultTileSize, // 256x256.
+		Workers:  4,
+		Context:  ctx,
+	}
+	if err := draw.DrawTiled(dst, dst.Bounds(), img, image.Point{}, draw.Over, opts); err != nil {
+		log.Fatal(err)
+	}
+
+	// Sequential mode is useful when debugging or when the caller already owns
+	// a worker.
+	opts.Sequential = true
+	if err := draw.DrawTiled(dst, dst.Bounds(), img, image.Point{}, draw.Over, opts); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("dst has bounds %v.\n", dst.Bounds())
+	// Output:
+	// dst has bounds (0,0)-(4096,4096).
 }
