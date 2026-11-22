@@ -45,6 +45,7 @@ import (
 	"errors"
 	"image"
 	"io"
+	"sync/atomic"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
@@ -670,6 +671,37 @@ type Font struct {
 		unitsPerEm       Units
 		xHeight          int32
 	}
+
+	// glyphCacheID uniquely identifies this Font within the process, including
+	// distinct Font values parsed from the same font collection. It is the
+	// per-font component of a GlyphCache key.
+	glyphCacheID uint64
+
+	// glyphCache, when non-nil, caches the decoded outlines produced by
+	// LoadGlyph. It is stored atomically so that SetGlyphCache can race with
+	// concurrent LoadGlyph calls.
+	glyphCache atomic.Pointer[GlyphCache]
+}
+
+// SetGlyphCache attaches c to f, enabling outline caching for subsequent
+// LoadGlyph, GlyphBounds and (indirectly) any other method that decodes
+// glyph outlines. Passing a nil *GlyphCache detaches the cache, restoring the
+// uncached behavior.
+//
+// The same GlyphCache may be attached to multiple Font values, including
+// Font values from the same Collection: cache entries are still keyed by the
+// individual font, glyph index and ppem, so fonts and glyphs can never be
+// confused with one another.
+//
+// SetGlyphCache is safe to call concurrently with Font methods.
+func (f *Font) SetGlyphCache(c *GlyphCache) {
+	f.glyphCache.Store(c)
+}
+
+// GlyphCache returns the GlyphCache attached to f, or nil if none is
+// attached.
+func (f *Font) GlyphCache() *GlyphCache {
+	return f.glyphCache.Load()
 }
 
 // NumGlyphs returns the number of glyphs in f.
@@ -682,6 +714,9 @@ func (f *Font) initialize(offset int, isDfont bool) error {
 	if !f.src.valid() {
 		return errInvalidSourceData
 	}
+	// Every successfully initialized Font gets a unique id, even one parsed
+	// from the same []byte or Collection as another Font.
+	f.glyphCacheID = nextGlyphCacheID()
 	buf, finalTableOffset, isPostScript, err := f.initializeTables(offset, isDfont)
 	if err != nil {
 		return err
@@ -1421,10 +1456,51 @@ type LoadGlyphOptions struct {
 //
 // In the returned Segments' (x, y) coordinates, the Y axis increases down.
 //
+// If f has a GlyphCache attached (see Font.SetGlyphCache), repeated requests
+// for the same glyph at the same ppem are served from that cache instead of
+// re-parsing the font data. With a non-nil b, the returned Segments are a
+// private copy (and retain the usual b re-use semantics); with a nil b the
+// returned Segments are shared read-only cache data and must not be modified.
+//
 // It returns ErrNotFound if the glyph index is out of range. It returns
 // ErrColoredGlyph if the glyph is not a monochrome vector glyph, such as a
 // colored (bitmap or vector) emoji glyph.
 func (f *Font) LoadGlyph(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, opts *LoadGlyphOptions) (Segments, error) {
+	if c := f.glyphCache.Load(); c != nil {
+		key := glyphCacheKey{
+			fontID: f.glyphCacheID,
+			ppem:   ppem,
+			glyph:  x,
+		}
+		if cached, ok := c.lookup(key); ok {
+			if b == nil {
+				// The caller has no Buffer to own a copy: return the shared,
+				// read-only cache entry directly.
+				return cached, nil
+			}
+			// Copy into the caller's Buffer so that re-using b cannot mutate
+			// the cache and the entry stays safe to share with other
+			// goroutines.
+			b.segments = append(b.segments[:0], cached...)
+			return b.segments, nil
+		}
+
+		segments, err := f.loadGlyphUncached(b, x, ppem, opts)
+		if err != nil {
+			return nil, err
+		}
+		// Only successfully decoded outlines are cached. put takes its own
+		// copy of segments, so the cache never aliases the caller's Buffer.
+		c.put(key, segments)
+		return segments, nil
+	}
+	return f.loadGlyphUncached(b, x, ppem, opts)
+}
+
+// loadGlyphUncached implements LoadGlyph without consulting or populating a
+// GlyphCache. Its semantics and error values are the historical LoadGlyph
+// behavior, unchanged by the addition of caching.
+func (f *Font) loadGlyphUncached(b *Buffer, x GlyphIndex, ppem fixed.Int26_6, opts *LoadGlyphOptions) (Segments, error) {
 	if b == nil {
 		b = &Buffer{}
 	}
