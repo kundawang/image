@@ -450,30 +450,49 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	return nil
 }
 
-func newDecoder(r io.Reader) (*decoder, error) {
-	d := &decoder{
-		r:        newReaderAt(r),
-		features: make(map[int][]uint),
-	}
+// readHeader reads the 8-byte TIFF header from r and returns r as an
+// io.ReaderAt (buffering r if necessary), the byte order of the file and
+// the offset of the first IFD, which is 0 if the file contains no pages.
+func readHeader(r io.Reader) (ra io.ReaderAt, byteOrder binary.ByteOrder, ifdOffset int64, err error) {
+	ra = newReaderAt(r)
 
 	p := make([]byte, 8)
-	if _, err := d.r.ReadAt(p, 0); err != nil {
+	if _, err := ra.ReadAt(p, 0); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, err
+		return nil, nil, 0, err
 	}
 	switch string(p[0:4]) {
 	case leHeader:
-		d.byteOrder = binary.LittleEndian
+		byteOrder = binary.LittleEndian
 	case beHeader:
-		d.byteOrder = binary.BigEndian
+		byteOrder = binary.BigEndian
 	default:
-		return nil, FormatError("malformed header")
+		return nil, nil, 0, FormatError("malformed header")
 	}
 
-	ifdOffset := int64(d.byteOrder.Uint32(p[4:8]))
+	return ra, byteOrder, int64(byteOrder.Uint32(p[4:8])), nil
+}
 
+func newDecoder(r io.Reader) (*decoder, error) {
+	ra, byteOrder, ifdOffset, err := readHeader(r)
+	if err != nil {
+		return nil, err
+	}
+	return newDecoderAt(ra, byteOrder, ifdOffset)
+}
+
+// newDecoderAt parses the IFD at ifdOffset and returns a decoder for that
+// single page.
+func newDecoderAt(ra io.ReaderAt, byteOrder binary.ByteOrder, ifdOffset int64) (*decoder, error) {
+	d := &decoder{
+		r:         ra,
+		byteOrder: byteOrder,
+		features:  make(map[int][]uint),
+	}
+
+	p := make([]byte, 8)
 	// The first two bytes contain the number of entries (12 bytes each).
 	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
 		return nil, err
@@ -625,12 +644,18 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 
 // Decode reads a TIFF image from r and returns it as an image.Image.
 // The type of Image returned depends on the contents of the TIFF.
-func Decode(r io.Reader) (img image.Image, err error) {
+// If r contains a multi-page TIFF, only the first page is decoded;
+// use NewDecoder to iterate over all pages.
+func Decode(r io.Reader) (image.Image, error) {
 	d, err := newDecoder(r)
 	if err != nil {
-		return
+		return nil, err
 	}
+	return d.decodeImage()
+}
 
+// decodeImage decodes the pixel data of the single page described by d.
+func (d *decoder) decodeImage() (img image.Image, err error) {
 	blockPadding := false
 	blockWidth := d.config.Width
 	blockHeight := d.config.Height

@@ -523,7 +523,7 @@ func newTIFF(enc byteOrder) []byte {
 	b := []byte{0, 0, 0, 42, 0, 0, 0, 0}
 	switch enc.Uint16([]byte{1, 0}) {
 	case 0x1:
-		b[0], b[1] = 'I', 'I'
+		b[0], b[1], b[2], b[3] = 'I', 'I', 42, 0
 	case 0x100:
 		b[0], b[1] = 'M', 'M'
 	default:
@@ -535,6 +535,15 @@ func newTIFF(enc byteOrder) []byte {
 // appendIFD appends an IFD to the TIFF in b,
 // updating the IFD location in the header.
 func appendIFD(b []byte, enc byteOrder, entries map[uint16]interface{}) []byte {
+	b, _ = appendIFDAt(b, enc, entries, 4)
+	return b
+}
+
+// appendIFDAt appends an IFD to the TIFF in b, writing the IFD's offset
+// into the 4 bytes at linkPos (the header's first-IFD field or a previous
+// IFD's next-IFD field). It returns the extended b and the position of the
+// new IFD's own next-IFD field, which is 0 until another IFD is linked in.
+func appendIFDAt(b []byte, enc byteOrder, entries map[uint16]interface{}, linkPos int) ([]byte, int) {
 	var tags []uint16
 	for tag := range entries {
 		tags = append(tags, tag)
@@ -590,11 +599,12 @@ func appendIFD(b []byte, enc byteOrder, entries map[uint16]interface{}) []byte {
 		}
 	}
 
-	enc.PutUint32(b[4:8], uint32(len(b)))
+	enc.PutUint32(b[linkPos:linkPos+4], uint32(len(b)))
 	b = enc.AppendUint16(b, uint16(len(entries)))
 	b = append(b, ifd...)
+	nextPos := len(b)
 	b = enc.AppendUint32(b, 0)
-	return b
+	return b, nextPos
 }
 
 // ioReader wraps an io.Reader to hide any io.ReaderAt implementation,
