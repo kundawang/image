@@ -198,10 +198,8 @@ func (z *Rasterizer) LineTo(bx, by float32) {
 // The coordinates are allowed to be out of the Rasterizer's bounds.
 func (z *Rasterizer) QuadTo(bx, by, cx, cy float32) {
 	ax, ay := z.penX, z.penY
-	devsq := devSquared(ax, ay, bx, by, cx, cy)
-	if devsq >= 0.333 {
-		const tol = 3
-		n := 1 + int(math.Sqrt(math.Sqrt(tol*float64(devsq))))
+	n := quadSegmentCount(devSquared(ax, ay, bx, by, cx, cy))
+	if n > 1 {
 		t, nInv := float32(0), 1/float32(n)
 		for i := 0; i < n-1; i++ {
 			t += nInv
@@ -211,6 +209,22 @@ func (z *Rasterizer) QuadTo(bx, by, cx, cy float32) {
 		}
 	}
 	z.LineTo(cx, cy)
+}
+
+// quadSegmentCount returns the number of line segments that approximate a
+// quadratic Bézier segment whose devSquared flatness measure is devsq.
+//
+// This is the shared geometry core used by both the Rasterizer (to flatten
+// the curve during rasterization) and the Path bounds computation.
+func quadSegmentCount(devsq float32) int {
+	// The negated comparison preserves the original `devsq >= 0.333`
+	// semantics exactly, including for a non-finite devsq (a NaN comparison
+	// is false, so such a curve is flattened into a single segment).
+	if !(devsq >= 0.333) {
+		return 1
+	}
+	const tol = 3
+	return 1 + int(math.Sqrt(math.Sqrt(tol*float64(devsq))))
 }
 
 // CubeTo adds a cubic Bézier segment, from the pen via (bx, by) and (cx, cy)
@@ -223,9 +237,8 @@ func (z *Rasterizer) CubeTo(bx, by, cx, cy, dx, dy float32) {
 	if devsqAlt := devSquared(ax, ay, cx, cy, dx, dy); devsq < devsqAlt {
 		devsq = devsqAlt
 	}
-	if devsq >= 0.333 {
-		const tol = 3
-		n := 1 + int(math.Sqrt(math.Sqrt(tol*float64(devsq))))
+	n := quadSegmentCount(devsq)
+	if n > 1 {
 		t, nInv := float32(0), 1/float32(n)
 		for i := 0; i < n-1; i++ {
 			t += nInv
