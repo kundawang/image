@@ -6,4 +6,9 @@
 //
 // WEBP is defined at:
 // https://developers.google.com/speed/webp/docs/riff_container
+//
+// Decode and DecodeConfig only report pixels and image configuration.
+// DecodeConfigWithMetadata additionally reports the file's EXIF, XMP, ICC
+// profile and unrecognized metadata chunks in a single pass that does not
+// decode pixels or require a seekable reader.
 package webp // import "golang.org/x/image/webp"
