@@ -147,6 +147,12 @@ type bitReader struct {
 	br    uint32
 	bw    uint32
 	bytes [1024]uint8
+
+	// bytesRead is the total number of bytes ever read from r. The byte
+	// offset of the unread portion of the underlying stream is therefore
+	// (bytesRead - (bw - br)): the bits field holds bits that were already
+	// consumed from bytes before that offset.
+	bytesRead int64
 }
 
 func (b *bitReader) alignToByteBoundary() {
@@ -197,6 +203,7 @@ func (b *bitReader) nextBit() (uint64, error) {
 		n, err := b.r.Read(b.bytes[:])
 		b.br = 0
 		b.bw = uint32(n)
+		b.bytesRead += int64(n)
 		b.readErr = err
 
 		if b.order != MSB {
@@ -274,6 +281,12 @@ type reader struct {
 	//
 	// When driven through DecodeIntoGray, this field is unused.
 	rowsRemaining int
+
+	// rowsDecoded is the number of rows that have been fully decoded and
+	// passed along via the Read method. It is used to produce Checkpoints.
+	//
+	// When driven through DecodeIntoGray, this field is unused.
+	rowsDecoded int
 
 	// curr and prev hold the current and previous rows. Each element is either
 	// 0x00 (black) or 0xFF (white).
@@ -403,6 +416,7 @@ func (z *reader) Read(p []byte) (int, error) {
 		if z.ri == len(z.curr) {
 			z.ri, z.curr, z.prev = 0, z.prev, z.curr
 			z.atStartOfRow = true
+			z.rowsDecoded++
 		}
 	}
 
