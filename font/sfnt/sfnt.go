@@ -637,6 +637,13 @@ type Font struct {
 	// TODO: Others?
 	cblc table
 
+	// https://learn.microsoft.com/en-us/typography/opentype/spec/colr and
+	// https://learn.microsoft.com/en-us/typography/opentype/spec/cpal
+	// hold the color layers and color palettes of colored (e.g. emoji)
+	// glyphs. They are parsed lazily by the Font.LoadColorGlyph methods.
+	colr table
+	cpal table
+
 	// https://www.microsoft.com/typography/otspec/otff.htm#otttables
 	// "Advanced Typographic Tables".
 	//
@@ -842,6 +849,10 @@ func (f *Font) initializeTables(offset int, isDfont bool) (buf1 []byte, finalTab
 		switch tag {
 		case 0x43424c43:
 			f.cblc = table{o, n}
+		case 0x434f4c52: // "COLR"
+			f.colr = table{o, n}
+		case 0x4350414c: // "CPAL"
+			f.cpal = table{o, n}
 		case 0x43464620:
 			f.cff = table{o, n}
 		case 0x4f532f32:
@@ -1910,6 +1921,13 @@ type Buffer struct {
 	// psi is a PostScript interpreter for when the Font is an OpenType/CFF
 	// font.
 	psi psInterpreter
+
+	// colorLayers holds COLR/CPAL color glyph layers. See Font.LoadColorGlyph.
+	colorLayers []ColorGlyphLayer
+	// colorPaintStack and colorPaintSeen are scratch space for walking a COLR
+	// v1 paint graph and detecting cycles in it.
+	colorPaintStack []colorPaintFrame
+	colorPaintSeen  []GlyphIndex
 }
 
 func (b *Buffer) view(src *source, offset, length int) ([]byte, error) {
